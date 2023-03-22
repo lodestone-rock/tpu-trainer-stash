@@ -144,6 +144,10 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     # ensure image exist
     data = pd.read_csv(csv_file)
     image_favs = data["fav_score"] = data["fav_count"] - data["fav_score"]
+    rng, key = jax.random.split(rng)
+    scores_kde = jax.scipy.stats.gaussian_kde(
+        image_favs.sample(8192, replace=False, random_state=jax.device_get(key[0]))
+    )
     image_list = os.listdir(image_dir)
     data = data.loc[data[image_name_col].isin(image_list)]
 
@@ -470,10 +474,23 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
                 lambda a: jax.lax.all_gather(a, axis="batch", tiled=True),
                 (l2_err, labels),
             )
-            ranking_term = rax.pairwise_logistic_loss(
-                scores=l2_err, labels=labels, lambdaweight_fn=rax.labeldiff_lambdaweight
-            )
-            return ranking_term + 0.01 * jnp.mean(l2_err)
+            density = scores_kde.pdf(batch["image_scores"])
+
+            def dos_loss(l2_err, labels, density, lmbda_=0.33):
+                """
+                Try to regress more heavily onto images with high scores than
+                low scores. Weight by inverse of return density.
+                https://arxiv.org/abs/2301.12842
+                """
+                sorter = labels.reshape(-1).argsort()[::-1]
+                density = jnp.take(density.reshape(-1), sorter).reshape(-1, 1)
+                weights = jnp.triu(density @ density.T, k=1)
+                l2_err = jnp.take(l2_err.reshape(-1), sorter).reshape(-1, 1)
+                scores = -l2_err - np.logaddexp(-l2_err, -lmbda_ * l2_err.T)
+                invmag = 1 / jnp.sum(weights)
+                return -jnp.sum(weights * scores * invmag)
+
+            return dos_loss(l2_err, labels, density)
 
         # perform autograd
         grad_fn = jax.value_and_grad(compute_loss)
