@@ -461,9 +461,15 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
                     f"Unknown prediction type {noise_scheduler.config.prediction_type}"
                 )
 
-            l2_err = optax.l2_loss(target, model_pred)
-            labels = -batch["image_scores"][0]
+            l2_err = optax.l2_loss(target, model_pred).mean(
+                axis=tuple(range(model_pred.ndim)[1:])
+            )
+            labels = -batch["image_scores"]
             # Try to regress more heavily onto images with high scores than low scores
+            l2_err, labels = map(
+                lambda a: jax.lax.all_gather(a, axis="batch", tiled=True),
+                (l2_err, labels),
+            )
             ranking_term = rax.pairwise_logistic_loss(
                 scores=l2_err, labels=labels, lambdaweight_fn=rax.labeldiff_lambdaweight
             )
