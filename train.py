@@ -550,7 +550,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
                 height_col=width_height[1],
                 tokenizer_path=model_dir,
                 batch_slice=token_concatenate_count,
-                score_col=score_col
+                score_col=score_col,
             )
             if print_debug and queue.full():
                 print("queue is full!")
@@ -602,11 +602,11 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     for x in batch_order:
         # grab training array from queue
         current_batch = batch_queue.get()
-        
+
         # (current_batch)
         # split it to multiple devices
         batch = shard(current_batch)
-        
+
         # update loading bar
         train_step_progress_bar.update(1)
 
