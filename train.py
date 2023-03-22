@@ -143,6 +143,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     # ===============[pandas batching & bucketing]=============== #
     # ensure image exist
     data = pd.read_csv(csv_file)
+    image_favs = data["fav_score"] = data["fav_count"] - data["fav_score"]
     image_list = os.listdir(image_dir)
     data = data.loc[data[image_name_col].isin(image_list)]
 
