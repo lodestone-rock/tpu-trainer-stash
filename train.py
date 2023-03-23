@@ -2,30 +2,32 @@
 import os
 
 os.environ["JAX_USE_PJRT_C_API_ON_TPU"] = "1"  # memory defrag do not disable!
-import random
-import time
 import logging
+import random
 import sys
+import time
 from multiprocessing import Process, Queue
+
+import jax
+import jax.numpy as jnp
+import numpy as np
 
 # basic stuff
 import pandas as pd
 import rax
-import jax
-import jax.numpy as jnp
-from tqdm.auto import tqdm
-import numpy as np
 
 # store cache xla compilation so you don't
 # have to wait everything to compile again ever
 from jax.experimental.compilation_cache import compilation_cache as cc
+from tqdm.auto import tqdm
+
+import flora
 
 cache_dir = "/home/user/project-fur/e6_dump/jax_reusable_cache"
 if jax.devices()[0].platform == "tpu":
     cc.initialize_cache(cache_dir)
 
-# all ML stuff
-from transformers import CLIPFeatureExtractor, CLIPTokenizer, FlaxCLIPTextModel
+import optax
 from diffusers import (
     FlaxAutoencoderKL,
     FlaxDDPMScheduler,
@@ -34,22 +36,20 @@ from diffusers import (
     FlaxUNet2DConditionModel,
 )
 from diffusers.pipelines.stable_diffusion import FlaxStableDiffusionSafetyChecker
-import optax
 from flax import jax_utils
 from flax.training import train_state
 from flax.training.common_utils import shard
 
+# all ML stuff
+from transformers import CLIPFeatureExtractor, CLIPTokenizer, FlaxCLIPTextModel
+
 # local import
-from batch_processor import (
-    generate_batch,
-    process_image,
-    tokenize_text,
-)
+from batch_processor import generate_batch, process_image, tokenize_text
 from dataframe_processor import (
     discrete_scale_to_equal_area,
     resolution_bucketing_batch_with_chunking,
-    tag_suffler_to_comma_separated,
     scale_by_minimum_axis,
+    tag_suffler_to_comma_separated,
 )
 
 start_epoch = 0
@@ -299,13 +299,26 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
 
     # ===============[train state and scheduler]=============== #
 
-    unet_state = train_state.TrainState.create(
-        apply_fn=unet.__call__, params=unet_params, tx=u_net_optimizer
-    )
+    rng, key = jax.random.split(rng)
+    rng, key = jax.random.split(rng)
 
+    def fusor_apply_fn(base_apply_fn, frozen_params):
+        def apply_fn(adapter, *args, **kwargs):
+            params = flora.fuse(frozen_params, adapter)
+            base_apply_fn(params, *args, **kwargs)
+
+        return apply_fn
+
+    rng, key = jax.random.split(rng)
+    unet_state = train_state.TrainState.create(
+        apply_fn=fusor_apply_fn(unet.__call__, unet_params),
+        params=flora.init(key, {"params": unet_params}),
+        tx=u_net_optimizer,
+    )
+    rng, key = jax.random.split(rng)
     text_encoder_state = train_state.TrainState.create(
-        apply_fn=text_encoder.__call__,
-        params=text_encoder.params,
+        apply_fn=fusor_apply_fn(text_encoder.__call__, text_encoder.params),
+        params=flora.init(key, text_encoder.params),
         tx=text_encoder_optimizer,
     )
 
@@ -332,9 +345,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
         # generate rng and return new_train_rng to be used for the next iteration step
         dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng, num=3)
 
-        params = {"text_encoder": text_encoder_state.params, "unet": unet_state.params}
-
-        def compute_loss(params):
+        def compute_loss(adapters):
             # Convert images to latent space
             vae_outputs = vae.apply(
                 {"params": vae_params},
@@ -394,7 +405,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
             # encoder_hidden_states shape (batch & token_append, token, hidden_states)
             encoder_hidden_states = text_encoder_state.apply_fn(
                 batch["input_ids"],
-                params=params["text_encoder"],
+                params=adapters["text_encoder"],
                 dropout_rng=dropout_rng,
                 train=True,
             )[0]
@@ -440,7 +451,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
             # Predict the noise residual because predicting image is hard :P
             # essentially try to undo the noise process
             model_pred = unet.apply(
-                {"params": params["unet"]},
+                adapters["unet"],
                 noisy_latents,
                 timesteps,
                 encoder_hidden_states,
@@ -470,10 +481,13 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
             return ranking_term + 0.01 * jnp.mean(l2_err)
 
         # perform autograd
+        adapters = {
+            "text_encoder": text_encoder_state.params,
+            "unet": unet_state.params,
+        }
         grad_fn = jax.value_and_grad(compute_loss)
-        loss, grad = grad_fn(params)
+        loss, grad = grad_fn(adapters)
         grad = jax.lax.pmean(grad, "batch")
-
         # update weight and bias value
         new_unet_state = unet_state.apply_gradients(grads=grad["unet"])
         new_text_encoder_state = text_encoder_state.apply_gradients(
