@@ -13,6 +13,7 @@ from multiprocessing import Process, Queue
 import jax
 import jax.tree_util as jtu
 import jax.numpy as jnp
+import scipy.stats as sst
 
 # basic stuff
 import pandas as pd
@@ -84,7 +85,7 @@ def main(epoch=0, steps_offset=0, lr=1e-5):
 
     # diffusers model
     # initial model
-    base_model_name = "size-512-squared_no-eos-bos_shuffled_lion-optim_custom-loss-e"
+    base_model_name = "size-512-squared_no-eos-bos_shuffled_lion-optim_dos-loss-asam-e"
     model_dir = f"e6_dump/{base_model_name}{epoch}"  # continue from last model
     weight_dtype = jnp.bfloat16  # mixed precision training
     optimizer_algorithm = "lion"
@@ -144,6 +145,7 @@ def main(epoch=0, steps_offset=0, lr=1e-5):
         pd.read_csv("e6score/posts.csv", usecols=["md5", score_col], index_col="md5")
     )
     data.loc[data[score_col].isna(), score_col] = 0.0
+    util_tau = 1 / sst.expon.fit(data[score_col].values)[1]
     # create bucket resolution
     if use_ragged_batching:
         data_processed = scale_by_minimum_axis(
@@ -294,7 +296,7 @@ def main(epoch=0, steps_offset=0, lr=1e-5):
 
         params = {"text_encoder": text_encoder_state.params, "unet": unet_state.params}
 
-        # @jax.remat
+        @jax.remat
         def compute_loss(params):
             # Convert images to latent space
             vae_outputs = vae.apply(
@@ -427,7 +429,7 @@ def main(epoch=0, steps_offset=0, lr=1e-5):
                 lambda a: jax.lax.all_gather(a, "batch", tiled=True),
                 (l2_err, labels),
             )
-            density = jax.nn.softmax(labels)
+            density = jax.nn.softmax(labels * util_tau)
 
             def dos_loss(l2_err, labels, density, lmbda_=0.25):
                 """
@@ -454,7 +456,9 @@ def main(epoch=0, steps_offset=0, lr=1e-5):
                 params,
                 grad,
             )
-            desc = jtu.tree_map(lambda w, dw: w + w**2 * dw * step, params, grad)
+            desc = jtu.tree_map(
+                lambda w, dw, nu: w + w**2 * dw * nu, params, grad, step
+            )
         else:
             desc = params
         loss, grad = jax.value_and_grad(compute_loss)(desc)
