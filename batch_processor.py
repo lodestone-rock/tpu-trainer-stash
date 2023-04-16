@@ -1,6 +1,5 @@
 import concurrent.futures as cft
-import pathlib
-from typing import Callable, Union
+from typing import Callable, Sequence
 
 import cv2
 import numpy as np
@@ -10,7 +9,7 @@ from transformers import CLIPTokenizer
 
 def process_image(
     image_path: str,
-    rescale_size: Union[list, tuple],
+    rescale_size: Sequence[int],
 ) -> np.array:
     r"""
     scale the image resolution to predetermined resolution and return
@@ -25,29 +24,32 @@ def process_image(
     """
     image = np.flip(cv2.imread(image_path, cv2.IMREAD_COLOR), axis=-1)
     dimen = np.array(image.shape[:2])
-    minor_axis, major_axis = np.argsort(dimen)
+    axis_keys = np.argsort(dimen)
+    minor_axis, major_axis = axis_keys
     # rescale image with scaling factor
     scale_factor = np.max(rescale_size / dimen)
-    scale = tuple(np.rint(dimen * scale_factor))
+    scale = tuple(np.rint(dimen * scale_factor).astype(int))[::-1]
     inter = cv2.INTER_LINEAR
     image = cv2.resize(image, scale, interpolation=inter)
     # get smallest and largest res from image
     # warning
-    if dimen.max() < max(rescale_size):
+    if dimen[major_axis] < max(rescale_size):
         print(
             f"[WARN] image {image_path} is smaller than designated batch, zero pad will be added"
         )
 
-    delta = (dimen[major_axis] - dimen[minor_axis]) // 2
-    image = np.take(image, np.arange(delta, dimen[major_axis] - delta), axis=major_axis)
+    delta = (image.shape[major_axis] - image.shape[minor_axis]) // 2
+    if delta != 0:
+        index = [slice(None)] * image.ndim
+        index[major_axis] = slice(delta, -delta)
+        image = image[tuple(index)]
     # cheeky resize to catch missmatch
-    image = cv2.resize(image, scale, interpolation=inter)
+    if image.shape[:2] != rescale_size:
+        image = cv2.resize(image, rescale_size, interpolation=inter)
     # normalize
     image = image / 127.5 - 1
     # HWC -> CHW
     image = image.swapaxes(-3, -1)
-    # add batch axis
-    # np_image = np.expand_dims(np_image, axis=0)
     return image
 
 

@@ -1,5 +1,6 @@
 # python stuff
 import os
+import inspect
 
 os.environ["JAX_USE_PJRT_C_API_ON_TPU"] = "1"  # memory defrag do not disable!
 import concurrent.futures as cft
@@ -10,6 +11,7 @@ import time
 from multiprocessing import Process, Queue
 
 import jax
+import jax.tree_util as jtu
 import jax.numpy as jnp
 
 # basic stuff
@@ -32,7 +34,6 @@ from diffusers import (
     FlaxStableDiffusionPipeline,
     FlaxUNet2DConditionModel,
 )
-from diffusers.pipelines.stable_diffusion import FlaxStableDiffusionSafetyChecker
 from flax import jax_utils
 from flax.training import train_state
 from flax.training.common_utils import shard
@@ -53,7 +54,7 @@ start_epoch = 0
 number_of_epoch = 10
 
 
-def main(epoch=0, steps_offset=0, lr=2e-6):
+def main(epoch=0, steps_offset=0, lr=1e-5):
     # ===============[global var]=============== #
 
     # master seed
@@ -61,9 +62,9 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
 
     # pandas bucketing
     csv_file = "posts.csv"
-    image_dir = "e6_dump/resized"
-    batch_num = 8
-    batch_size = 8 * batch_num
+    image_dir = "e6_dump/resized/"
+    batch_num = 20
+    batch_size = jax.device_count() * batch_num
     maximum_resolution_area = [512**2]
     bucket_lower_bound_resolution = [512]
     maximum_axis = 1024
@@ -80,7 +81,6 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     token_concatenate_count = 3
     token_length = 75 * token_concatenate_count + 2
     score_col = "fav_count"
-    use_sam = True
 
     # diffusers model
     # initial model
@@ -88,16 +88,14 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     model_dir = f"e6_dump/{base_model_name}{epoch}"  # continue from last model
     weight_dtype = jnp.bfloat16  # mixed precision training
     optimizer_algorithm = "lion"
-    adam_to_lion_scale_factor = 7
     text_encoder_learning_rate = lr / 4 * batch_num
-    u_net_learning_rate = lr * batch_num
+    u_net_learning_rate = lr * batch_num**0.5
     text_encoder_learning_rate = text_encoder_learning_rate
     save_step = 6000
     # saved model name
     model_name = f"{base_model_name}{epoch+1}"
     output_dir = f"e6_dump/{model_name}"
     print_loss = True
-    debug = False  # enable to perform short training loop
     average_loss_step_count = 100
     # let unet decide the color to not be centered around 0 mean
     # enable only at the last epoch
@@ -106,7 +104,10 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
 
     # logger
     log_file_output = "logs.txt"
-    loss_csv = f"{model_name}.csv"
+    csv_dir = "csvs"
+    if not os.path.exists(csv_dir):
+        os.mkdir(csv_dir)
+    loss_csv = f"{csv_dir}/{model_name}.csv"
 
     # ===============[logger]=============== #
 
@@ -129,7 +130,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     # ===============[Initialize training RNG]=============== #
 
     rng = jax.random.PRNGKey(seed)
-    train_rngs = jax.random.split(rng, jax.local_device_count())
+    train_rngs = jax.random.split(rng, jax.device_count())
     logging.info("generate RNG")
 
     # ===============[pandas batching & bucketing]=============== #
@@ -138,11 +139,11 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     rng = jax.random.split(rng)[1]
     image_list = os.listdir(image_dir)
     data = data.loc[data[image_name_col].isin(image_list)]
+    data[image_name_col] = image_dir + "/" + data[image_name_col]
     data = data.set_index("md5").join(
         pd.read_csv("e6score/posts.csv", usecols=["md5", score_col], index_col="md5")
     )
-    mask = data[score_col].isna()
-    data[score_col][mask] = 0.0
+    data.loc[data[score_col].isna(), score_col] = 0.0
     # create bucket resolution
     if use_ragged_batching:
         data_processed = scale_by_minimum_axis(
@@ -231,70 +232,29 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     logging.info("load models to TPU")
 
     # ===============[optimizer function]=============== #
+    optim_factor = 7 if optimizer_algorithm == "lion" else 1
+    base_optim = getattr(optax, optimizer_algorithm)
+    sam_stride = 1.0
+    u_net_opt_cfg = dict(
+        learning_rate=u_net_learning_rate / optim_factor,
+        b1=0.9,
+        b2=0.99,
+        weight_decay=1e-2 * optim_factor,
+    )
 
-    if optimizer_algorithm == "adamw":
-        # optimizer for U-Net
-        u_net_constant_scheduler = optax.constant_schedule(u_net_learning_rate)
-        u_net_adamw = optax.adamw(
-            learning_rate=u_net_constant_scheduler,
-            b1=0.9,
-            b2=0.999,
-            eps=1e-08,
-            weight_decay=1e-2,
-        )
-        u_net_optimizer = optax.chain(
-            optax.clip_by_global_norm(1),  # prevent explosion
-            u_net_adamw,
-        )
-
-        # optimizer for CLIP text encoder
-        text_encoder_constant_scheduler = optax.constant_schedule(
-            text_encoder_learning_rate
-        )
-        text_encoder_adamw = optax.adamw(
-            learning_rate=text_encoder_constant_scheduler,
-            b1=0.9,
-            b2=0.999,
-            eps=1e-08,
-            weight_decay=1e-2,
-        )
-        text_encoder_optimizer = optax.chain(
-            optax.clip_by_global_norm(1),  # prevent explosion
-            text_encoder_adamw,
-        )
-
-    if optimizer_algorithm == "lion":
-        u_net_constant_scheduler = optax.constant_schedule(
-            u_net_learning_rate / adam_to_lion_scale_factor
-        )
-        text_encoder_constant_scheduler = optax.constant_schedule(
-            text_encoder_learning_rate / adam_to_lion_scale_factor
-        )
-
-        # optimizer for U-Net
-        u_net_lion = optax.lion(
-            learning_rate=u_net_constant_scheduler,
-            b1=0.9,
-            b2=0.99,
-            weight_decay=1e-2 * adam_to_lion_scale_factor,
-        )
-        u_net_optimizer = optax.chain(
-            optax.clip_by_global_norm(1),  # prevent explosion
-            u_net_lion,
-        )
-
-        # optimizer for CLIP text encoder
-        text_encoder_lion = optax.lion(
-            learning_rate=text_encoder_constant_scheduler,
-            b1=0.9,
-            b2=0.99,
-            weight_decay=1e-2 * adam_to_lion_scale_factor,
-        )
-        text_encoder_optimizer = optax.chain(
-            optax.clip_by_global_norm(1),  # prevent explosion
-            text_encoder_lion,
-        )
-
+    epsilon = 1e-8
+    if "eps" in inspect.signature(base_optim).parameters:
+        u_net_opt_cfg["eps"] = epsilon
+    u_net_optimizer = optax.chain(
+        optax.adaptive_grad_clip(1e-3), base_optim(**u_net_opt_cfg)
+    )
+    text_encoder_opt_cfg = u_net_opt_cfg | dict(
+        learning_rate=text_encoder_learning_rate * optim_factor,
+        b2=0.999,
+    )
+    text_encoder_optimizer = optax.chain(
+        optax.adaptive_grad_clip(1e-3), base_optim(**text_encoder_opt_cfg)
+    )
     logging.info(f"setup optimizer: {optimizer_algorithm}")
 
     # ===============[train state and scheduler]=============== #
@@ -334,6 +294,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
 
         params = {"text_encoder": text_encoder_state.params, "unet": unet_state.params}
 
+        # @jax.remat
         def compute_loss(params):
             # Convert images to latent space
             vae_outputs = vae.apply(
@@ -345,8 +306,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
 
             # get sample distribution from VAE latent
             latents = vae_outputs.latent_dist.sample(sample_rng)
-            # (NHWC) -> (NCHW)
-            latents = jnp.transpose(latents, (0, 3, 1, 2))
+            latents = latents.swapaxes(-1, -3)
             # weird scaling don't touch it's a lazy normalization
             latents = latents * 0.18215
 
@@ -464,7 +424,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
             labels = batch["image_scores"]
             # Try to regress more heavily onto images with high scores than low scores
             l2_err, labels = map(
-                lambda a: jax.lax.all_gather(a, axis="batch", tiled=True),
+                lambda a: jax.lax.all_gather(a, "batch", tiled=True),
                 (l2_err, labels),
             )
             density = jax.nn.softmax(labels)
@@ -486,15 +446,18 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
             return dos_loss(l2_err, labels, density)
 
         # perform autograd
-        if use_sam:
+        if sam_stride != 0:
+            rho, eps = sam_stride, epsilon
             grad = jax.grad(compute_loss)(params)
-            ascent_stride = 0.01 / optax.global_norm(grad)
-            descent_params = optax.apply_updates(
-                params, jax.tree_util.tree_map(lambda dw: dw * ascent_stride, grad)
+            step = jtu.tree_map(
+                lambda w, dw: rho / optax.safe_norm(w * dw, eps),
+                params,
+                grad,
             )
+            desc = jtu.tree_map(lambda w, dw: w + w**2 * dw * step, params, grad)
         else:
-            descent_params = params
-        loss, grad = jax.value_and_grad(compute_loss)(descent_params)
+            desc = params
+        loss, grad = jax.value_and_grad(compute_loss)(desc)
         # update weight and bias value
         new_unet_state = unet_state.apply_gradients(grads=grad["unet"])
         new_text_encoder_state = text_encoder_state.apply_gradients(
@@ -520,7 +483,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     def checkpoint(unet_state, text_encoder_state, vae_params, output_dir):
         # get the first of 8 replicated weights and biases to be saved
         def get_params_to_save(params):
-            return jax.device_get(jax.tree_util.tree_map(lambda x: x[0], params))
+            return jax.device_get(jtu.tree_map(lambda x: x[0], params))
 
         # save using different scheduler because this one is prefered for inference
         scheduler, _ = FlaxPNDMScheduler.from_pretrained(
@@ -588,13 +551,6 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     batch_order = batch_order[steps_offset:]
 
     # perfom short training run for debugging purposes
-    if debug:
-        batch_order = batch_order[:1000]
-        save_step = 100
-        average_loss_step_count = 20
-
-    training_step = 0
-
     train_step_progress_bar = tqdm(
         total=len(batch_order), desc="Training...", position=1, leave=False
     )
@@ -605,11 +561,11 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     global_step = 0
 
     # store training array here
-    batch_queue = Queue(maxsize=10)
+    batch_queue = Queue(maxsize=32)
 
     # spawn another process for processing images
     batch_processor = Process(
-        target=generate_batch_wrapper, args=[batch_order, batch_queue, debug]
+        target=generate_batch_wrapper, args=[batch_order, batch_queue]
     )
     batch_processor.start()
     start = time.time()
