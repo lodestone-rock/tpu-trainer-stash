@@ -1,0 +1,9 @@
+https://huggingface.co/datasets/ribster/sd-yff/resolve/main/yff768.tar.gz.part-aa
+https://huggingface.co/datasets/ribster/sd-yff/resolve/main/yff768.tar.gz.part-ab
+https://huggingface.co/datasets/ribster/sd-yff/resolve/main/yff768.tar.gz.part-ac
+https://huggingface.co/datasets/ribster/sd-yff/resolve/main/yff768.tar.gz.part-ad
+https://huggingface.co/datasets/ribster/sd-yff/resolve/main/yff768.tar.gz.part-ae
+https://huggingface.co/datasets/ribster/sd-yff/resolve/main/yff768.tar.gz.part-af
+https://huggingface.co/datasets/ribster/sd-yff/resolve/main/yff768.tar.gz.part-ag
+https://huggingface.co/datasets/ribster/sd-yff/resolve/main/yff768.tar.gz.part-ah
+https://huggingface.co/datasets/ribster/sd-yff/resolve/main/yff768.tar.gz.part-ai
