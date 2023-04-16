@@ -2,55 +2,44 @@
 import os
 
 os.environ["JAX_USE_PJRT_C_API_ON_TPU"] = "1"  # memory defrag do not disable!
-import random
-import time
 import logging
+import random
 import sys
+import time
 from multiprocessing import Process, Queue
 
+import jax
+import jax.numpy as jnp
+import numpy as np
 # basic stuff
 import pandas as pd
 import rax
-import jax
-import jax.numpy as jnp
-from tqdm.auto import tqdm
-import numpy as np
-
 # store cache xla compilation so you don't
 # have to wait everything to compile again ever
 from jax.experimental.compilation_cache import compilation_cache as cc
+from tqdm.auto import tqdm
 
 cache_dir = "/home/user/project-fur/e6_dump/jax_reusable_cache"
 if jax.devices()[0].platform == "tpu":
     cc.initialize_cache(cache_dir)
 
-# all ML stuff
-from transformers import CLIPFeatureExtractor, CLIPTokenizer, FlaxCLIPTextModel
-from diffusers import (
-    FlaxAutoencoderKL,
-    FlaxDDPMScheduler,
-    FlaxPNDMScheduler,
-    FlaxStableDiffusionPipeline,
-    FlaxUNet2DConditionModel,
-)
-from diffusers.pipelines.stable_diffusion import FlaxStableDiffusionSafetyChecker
 import optax
+from diffusers import (FlaxAutoencoderKL, FlaxDDPMScheduler, FlaxPNDMScheduler,
+                       FlaxStableDiffusionPipeline, FlaxUNet2DConditionModel)
+from diffusers.pipelines.stable_diffusion import \
+    FlaxStableDiffusionSafetyChecker
 from flax import jax_utils
 from flax.training import train_state
 from flax.training.common_utils import shard
+# all ML stuff
+from transformers import CLIPFeatureExtractor, CLIPTokenizer, FlaxCLIPTextModel
 
 # local import
-from batch_processor import (
-    generate_batch,
-    process_image,
-    tokenize_text,
-)
-from dataframe_processor import (
-    discrete_scale_to_equal_area,
-    resolution_bucketing_batch_with_chunking,
-    tag_suffler_to_comma_separated,
-    scale_by_minimum_axis,
-)
+from batch_processor import generate_batch, process_image, tokenize_text
+from dataframe_processor import (discrete_scale_to_equal_area,
+                                 resolution_bucketing_batch_with_chunking,
+                                 scale_by_minimum_axis,
+                                 tag_suffler_to_comma_separated)
 
 start_epoch = 0
 number_of_epoch = 10
@@ -63,12 +52,12 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     seed = 69 + epoch  # noice
 
     # pandas bucketing
-    csv_file = "/home/user/project-fur/score2.csv"
-    image_dir = "/home/user/project-fur/e6_dump/resized"
+    csv_file = "posts.csv"
+    image_dir = "e6_dump/resized"
     batch_num = 8
     batch_size = 8 * batch_num
     maximum_resolution_area = [512**2]
-    bucket_lower_bound_resolution = [256]
+    bucket_lower_bound_resolution = [512]
     maximum_axis = 1024
     minimum_axis = 512
     # if true maximum_resolution_area and bucket_lower_bound_resolution not used
@@ -83,7 +72,8 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     caption_col = "newtag_string"
     token_concatenate_count = 3
     token_length = 75 * token_concatenate_count + 2
-    score_col = "fav_score"
+    score_col = "fav_count"
+    use_sam = True
 
     # diffusers model
     # initial model
@@ -94,12 +84,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     adam_to_lion_scale_factor = 7
     text_encoder_learning_rate = lr / 4 * batch_num
     u_net_learning_rate = lr * batch_num
-    u_net_learning_rate = jax.device_put(
-        np.array(u_net_learning_rate), device=jax.devices("cpu")[0]
-    )
-    text_encoder_learning_rate = jax.device_put(
-        np.array(text_encoder_learning_rate), device=jax.devices("cpu")[0]
-    )
+    text_encoder_learning_rate = text_encoder_learning_rate
     save_step = 6000
     # saved model name
     model_name = f"{base_model_name}{epoch+1}"
@@ -129,7 +114,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     )
 
     with open(loss_csv, "w") as loss_file:
-        loss_file.write(f"global_step,loss,checkpoint_counter,time")
+        loss_file.write(f"global_step,loss,time")
 
     logging.info("init logs")
     logging.info(f"model dir: {model_dir}")
@@ -143,14 +128,14 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     # ===============[pandas batching & bucketing]=============== #
     # ensure image exist
     data = pd.read_csv(csv_file)
-    image_favs = data["fav_score"] = data["fav_count"] - data["fav_score"]
-    rng, key = jax.random.split(rng)
-    scores_kde = jax.scipy.stats.gaussian_kde(
-        image_favs.sample(8192, replace=False, random_state=jax.device_get(key[0]))
-    )
+    rng = jax.random.split(rng)[1]
     image_list = os.listdir(image_dir)
     data = data.loc[data[image_name_col].isin(image_list)]
-
+    data = data.set_index("md5").join(
+        pd.read_csv("e6score/posts.csv", usecols=["md5", score_col], index_col="md5")
+    )
+    mask = data[score_col].isna()
+    data[score_col][mask] = 0.0
     # create bucket resolution
     if use_ragged_batching:
         data_processed = scale_by_minimum_axis(
@@ -211,7 +196,6 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     data_processed[caption_col] = data_processed[caption_col].apply(
         lambda x: shuffle(x, seed)
     )
-
     logging.info("creating bucket and dataloader sequence")
 
     # ===============[load model to CPU]=============== #
@@ -391,22 +375,21 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
             token_append_dim = batch["input_ids"].shape[1]
 
             # reshape batch["input_ids"] to shape (batch & token_append, token)
-            batch["input_ids"] = batch["input_ids"].reshape(
+            input_ids = batch["input_ids"].reshape(
                 -1, batch["input_ids"].shape[-1]
             )
             # Get the text embedding for conditioning
             # encoder_hidden_states shape (batch & token_append, token, hidden_states)
             encoder_hidden_states = text_encoder_state.apply_fn(
-                batch["input_ids"],
+                input_ids,
                 params=params["text_encoder"],
                 dropout_rng=dropout_rng,
                 train=True,
             )[0]
             print(encoder_hidden_states.shape)
             # reshape encoder_hidden_states to shape (batch, token_append, token, hidden_states)
-            encoder_hidden_states = jnp.reshape(
-                encoder_hidden_states,
-                (batch_dim, token_append_dim, -1, encoder_hidden_states.shape[-1]),
+            encoder_hidden_states = encoder_hidden_states.reshape(
+                (batch_dim, token_append_dim, -1, encoder_hidden_states.shape[-1])
             )
             print(encoder_hidden_states.shape)
 
@@ -468,15 +451,15 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
             l2_err = optax.l2_loss(target, model_pred).mean(
                 axis=tuple(range(model_pred.ndim)[1:])
             )
-            labels = -batch["image_scores"]
+            labels = batch["image_scores"]
             # Try to regress more heavily onto images with high scores than low scores
             l2_err, labels = map(
                 lambda a: jax.lax.all_gather(a, axis="batch", tiled=True),
                 (l2_err, labels),
             )
-            density = scores_kde.pdf(batch["image_scores"])
+            density = jax.nn.softmax(labels)
 
-            def dos_loss(l2_err, labels, density, lmbda_=0.33):
+            def dos_loss(l2_err, labels, density, lmbda_=0.25):
                 """
                 Try to regress more heavily onto images with high scores than
                 low scores. Weight by inverse of return density.
@@ -486,17 +469,22 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
                 density = jnp.take(density.reshape(-1), sorter).reshape(-1, 1)
                 weights = jnp.triu(density @ density.T, k=1)
                 l2_err = jnp.take(l2_err.reshape(-1), sorter).reshape(-1, 1)
-                scores = -l2_err - np.logaddexp(-l2_err, -lmbda_ * l2_err.T)
+                scores = -l2_err - jnp.logaddexp(-l2_err, -lmbda_ * l2_err.T)
                 invmag = 1 / jnp.sum(weights)
                 return -jnp.sum(weights * scores * invmag)
 
             return dos_loss(l2_err, labels, density)
 
         # perform autograd
-        grad_fn = jax.value_and_grad(compute_loss)
-        loss, grad = grad_fn(params)
-        grad = jax.lax.pmean(grad, "batch")
-
+        if use_sam:
+            grad = jax.grad(compute_loss)(params)
+            ascent_stride = 0.01 / optax.global_norm(grad)
+            descent_params = optax.apply_updates(
+                params, jax.tree_util.tree_map(lambda dw: dw * ascent_stride, grad)
+            )
+        else:
+            descent_params = params
+        loss, grad = jax.value_and_grad(compute_loss)(descent_params)
         # update weight and bias value
         new_unet_state = unet_state.apply_gradients(grads=grad["unet"])
         new_text_encoder_state = text_encoder_state.apply_gradients(
@@ -572,7 +560,6 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
                 caption_token_length=token_length,
                 width_col=width_height[0],
                 height_col=width_height[1],
-                tokenizer_path=model_dir,
                 batch_slice=token_concatenate_count,
                 score_col=score_col,
             )
@@ -611,7 +598,6 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     train_metric = None
     sum_train_metric = 0
     global_step = 0
-    checkpoint_counter = 0
 
     # store training array here
     batch_queue = Queue(maxsize=10)
@@ -643,12 +629,11 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
                         unet_state,
                         text_encoder_state,
                         vae_params,
-                        f"{output_dir}-{checkpoint_counter}",
+                        f"{output_dir}-{global_step}",
                     )
                     logging.info(
                         f"=======================[saving models at {global_step} step(s)]======================="
                     )
-                    checkpoint_counter = checkpoint_counter + 1
                 except Exception as e:
                     time.sleep(2)
                     print(e)
