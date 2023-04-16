@@ -19,7 +19,7 @@ import rax
 from jax.experimental.compilation_cache import compilation_cache as cc
 from tqdm.auto import tqdm
 
-cache_dir = "/home/user/project-fur/e6_dump/jax_reusable_cache"
+cache_dir = "/tmp/jax_reusable_cache"
 if jax.devices()[0].platform == "tpu":
     cc.initialize_cache(cache_dir)
 
@@ -66,7 +66,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     repeat_batch = 10
 
     # batch generator (dataloader)
-    image_folder = "/home/user/project-fur/e6_dump/resized"
+    image_folder = "e6_dump/resized"
     image_name_col = "file"
     width_height = ["new_image_width", "new_image_height"]
     caption_col = "newtag_string"
@@ -78,7 +78,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     # diffusers model
     # initial model
     base_model_name = "size-512-squared_no-eos-bos_shuffled_lion-optim_custom-loss-e"
-    model_dir = f"/home/user/project-fur/e6_dump/{base_model_name}{epoch}"  # continue from last model
+    model_dir = f"e6_dump/{base_model_name}{epoch}"  # continue from last model
     weight_dtype = jnp.bfloat16  # mixed precision training
     optimizer_algorithm = "lion"
     adam_to_lion_scale_factor = 7
@@ -88,7 +88,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     save_step = 6000
     # saved model name
     model_name = f"{base_model_name}{epoch+1}"
-    output_dir = f"/home/user/project-fur/e6_dump/{model_name}"
+    output_dir = f"e6_dump/{model_name}"
     print_loss = True
     debug = False  # enable to perform short training loop
     average_loss_step_count = 100
@@ -200,20 +200,21 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
 
     # ===============[load model to CPU]=============== #
 
-    tokenizer = CLIPTokenizer.from_pretrained(model_dir, subfolder="tokenizer")
+    ckpt_name = model_dir if os.path.exists(model_dir) else "lodestones/stable-diffusion-v1-5-flax"
+    tokenizer = CLIPTokenizer.from_pretrained(ckpt_name, subfolder="tokenizer")
 
     text_encoder = FlaxCLIPTextModel.from_pretrained(
-        model_dir, subfolder="text_encoder", dtype=weight_dtype
+        ckpt_name, subfolder="text_encoder", dtype=weight_dtype
     )
 
     vae, vae_params = FlaxAutoencoderKL.from_pretrained(
-        model_dir,
+        ckpt_name,
         dtype=weight_dtype,
         subfolder="vae",
     )
 
     unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
-        model_dir, subfolder="unet", dtype=weight_dtype, use_memory_efficient=True
+        ckpt_name, subfolder="unet", dtype=weight_dtype, use_memory_efficient=True
     )
 
     logging.info("load models to TPU")
@@ -629,7 +630,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
                         unet_state,
                         text_encoder_state,
                         vae_params,
-                        f"{output_dir}-{global_step}",
+                        output_dir,
                     )
                     logging.info(
                         f"=======================[saving models at {global_step} step(s)]======================="
@@ -660,7 +661,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
                     # save loss to csv
                     with open(loss_csv, "a") as loss_file:
                         loss_file.write(
-                            f"\n{global_step},{loss},{checkpoint_counter},{time_elapsed}"
+                            f"\n{global_step},{loss},{time_elapsed}"
                         )
                     # reset sum
                     sum_train_metric = 0
