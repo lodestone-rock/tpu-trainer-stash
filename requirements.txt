@@ -1,0 +1,5 @@
+pandas
+jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+git+https://github.com/deepmind/optax
+diffusers[flax]
+transformers
