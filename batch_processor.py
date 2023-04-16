@@ -1,11 +1,10 @@
-from typing import Union, Callable
-import PIL
-from PIL import ImageFile, Image
-import pandas as pd
-import numpy as np
 import pathlib
-from transformers import CLIPTokenizer
+from typing import Callable, Union
 
+import numpy as np
+import pandas as pd
+from PIL import Image, ImageFile
+from transformers import CLIPTokenizer
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -182,7 +181,6 @@ def generate_batch(
     score_col: str,
     caption_col: str,
     caption_token_length: int,
-    tokenizer_path: str,
     width_col: str,
     height_col: str,
     batch_slice: int = 1,

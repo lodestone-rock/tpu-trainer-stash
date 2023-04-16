@@ -10,10 +10,10 @@ from multiprocessing import Process, Queue
 
 import jax
 import jax.numpy as jnp
-import numpy as np
+
 # basic stuff
 import pandas as pd
-import rax
+
 # store cache xla compilation so you don't
 # have to wait everything to compile again ever
 from jax.experimental.compilation_cache import compilation_cache as cc
@@ -24,22 +24,29 @@ if jax.devices()[0].platform == "tpu":
     cc.initialize_cache(cache_dir)
 
 import optax
-from diffusers import (FlaxAutoencoderKL, FlaxDDPMScheduler, FlaxPNDMScheduler,
-                       FlaxStableDiffusionPipeline, FlaxUNet2DConditionModel)
-from diffusers.pipelines.stable_diffusion import \
-    FlaxStableDiffusionSafetyChecker
+from diffusers import (
+    FlaxAutoencoderKL,
+    FlaxDDPMScheduler,
+    FlaxPNDMScheduler,
+    FlaxStableDiffusionPipeline,
+    FlaxUNet2DConditionModel,
+)
+from diffusers.pipelines.stable_diffusion import FlaxStableDiffusionSafetyChecker
 from flax import jax_utils
 from flax.training import train_state
 from flax.training.common_utils import shard
+
 # all ML stuff
 from transformers import CLIPFeatureExtractor, CLIPTokenizer, FlaxCLIPTextModel
 
 # local import
 from batch_processor import generate_batch, process_image, tokenize_text
-from dataframe_processor import (discrete_scale_to_equal_area,
-                                 resolution_bucketing_batch_with_chunking,
-                                 scale_by_minimum_axis,
-                                 tag_suffler_to_comma_separated)
+from dataframe_processor import (
+    discrete_scale_to_equal_area,
+    resolution_bucketing_batch_with_chunking,
+    scale_by_minimum_axis,
+    tag_suffler_to_comma_separated,
+)
 
 start_epoch = 0
 number_of_epoch = 10
@@ -200,7 +207,11 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
 
     # ===============[load model to CPU]=============== #
 
-    ckpt_name = model_dir if os.path.exists(model_dir) else "lodestones/stable-diffusion-v1-5-flax"
+    ckpt_name = (
+        model_dir
+        if os.path.exists(model_dir)
+        else "lodestones/stable-diffusion-v1-5-flax"
+    )
     tokenizer = CLIPTokenizer.from_pretrained(ckpt_name, subfolder="tokenizer")
 
     text_encoder = FlaxCLIPTextModel.from_pretrained(
@@ -376,9 +387,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
             token_append_dim = batch["input_ids"].shape[1]
 
             # reshape batch["input_ids"] to shape (batch & token_append, token)
-            input_ids = batch["input_ids"].reshape(
-                -1, batch["input_ids"].shape[-1]
-            )
+            input_ids = batch["input_ids"].reshape(-1, batch["input_ids"].shape[-1])
             # Get the text embedding for conditioning
             # encoder_hidden_states shape (batch & token_append, token, hidden_states)
             encoder_hidden_states = text_encoder_state.apply_fn(
@@ -660,9 +669,7 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
                     start = time.time()
                     # save loss to csv
                     with open(loss_csv, "a") as loss_file:
-                        loss_file.write(
-                            f"\n{global_step},{loss},{time_elapsed}"
-                        )
+                        loss_file.write(f"\n{global_step},{loss},{time_elapsed}")
                     # reset sum
                     sum_train_metric = 0
 
