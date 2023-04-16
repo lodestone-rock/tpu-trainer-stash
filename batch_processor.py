@@ -1,20 +1,17 @@
+import concurrent.futures as cft
 import pathlib
 from typing import Callable, Union
 
+import cv2
 import numpy as np
 import pandas as pd
-from PIL import Image, ImageFile
 from transformers import CLIPTokenizer
-
-ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def process_image(
     image_path: str,
     rescale_size: Union[list, tuple],
-    upper_bound: int = 10,
-    debug: bool = False,
-) -> Union[np.array, tuple]:
+) -> np.array:
     r"""
     scale the image resolution to predetermined resolution and return
     it as numpy
@@ -24,71 +21,34 @@ def process_image(
             path to file
         rescale_size (:obj:`list` or `tuple`):
             width and height target
-        upper_bound (:obj:`int`, *optional*, defaults to 10):
-            major axis obund (not important, just set it as high as possible)
-        debug (:obj:`bool`, *optional*, defaults to `False`):
-            will return tuple (np.array, PIL.Image)
-
-    return: np.array or (np.array, PIL.Image)
+    return: np.array
     """
-    image = Image.open(image_path)
-
-    # find the scaling factor for each axis
-    x_scale = rescale_size[0] / image.size[0]
-    y_scale = rescale_size[1] / image.size[1]
-    scaling_factor = max(x_scale, y_scale)
-
+    image = np.flip(cv2.imread(image_path, cv2.IMREAD_COLOR), axis=-1)
+    dimen = np.array(image.shape[:2])
+    minor_axis, major_axis = np.argsort(dimen)
     # rescale image with scaling factor
-    new_scale = [
-        round(image.size[0] * scaling_factor),
-        round(image.size[1] * scaling_factor),
-    ]
-    sampling_algo = PIL.Image.NEAREST
-    image = image.resize(new_scale, resample=sampling_algo)
-
+    scale_factor = np.max(rescale_size / dimen)
+    scale = tuple(np.rint(dimen * scale_factor))
+    inter = cv2.INTER_LINEAR
+    image = cv2.resize(image, scale, interpolation=inter)
     # get smallest and largest res from image
-    minor_axis_value = min(image.size)
-    minor_axis = image.size.index(minor_axis_value)
-    major_axis_value = max(image.size)
-    major_axis = image.size.index(major_axis_value)
-
     # warning
-    if max(image.size) < max(rescale_size):
+    if dimen.max() < max(rescale_size):
         print(
             f"[WARN] image {image_path} is smaller than designated batch, zero pad will be added"
         )
 
-    if minor_axis == 0:
-        # left and right same crop top and bottom
-        top = (image.size[1] - rescale_size[1]) // 2
-        bottom = (image.size[1] + rescale_size[1]) // 2
-
-        # remainder add
-        bottom_remainder = top + bottom
-        # left, top, right, bottom
-        image = image.crop((0, top, image.size[0], bottom))
-    else:
-        # top and bottom same crop the left and right
-        left = (image.size[0] - rescale_size[0]) // 2
-        right = (image.size[0] + rescale_size[0]) // 2
-        # left, top, right, bottom
-        image = image.crop((left, 0, right, image.size[1]))
-
+    delta = (dimen[major_axis] - dimen[minor_axis]) // 2
+    image = np.take(image, np.arange(delta, dimen[major_axis] - delta), axis=major_axis)
     # cheeky resize to catch missmatch
-    image = image.resize(rescale_size, resample=sampling_algo)
-    # for some reason np flip width and height
-    np_image = np.array(image)
+    image = cv2.resize(image, scale, interpolation=inter)
     # normalize
-    np_image = np_image / 127.5 - 1
-    # height width channel to channel height weight
-    np_image = np.transpose(np_image, (2, 0, 1))
+    image = image / 127.5 - 1
+    # HWC -> CHW
+    image = image.swapaxes(-3, -1)
     # add batch axis
     # np_image = np.expand_dims(np_image, axis=0)
-
-    if debug:
-        return (np_image, image)
-    else:
-        return np_image
+    return image
 
 
 def tokenize_text(
@@ -176,7 +136,6 @@ def generate_batch(
     tokenize_text_fn: Callable[[str, str, int], dict],
     tokenizer: CLIPTokenizer,
     dataframe: pd.DataFrame,
-    folder_path: str,
     image_name_col: str,
     score_col: str,
     caption_col: str,
@@ -184,6 +143,7 @@ def generate_batch(
     width_col: str,
     height_col: str,
     batch_slice: int = 1,
+    executor: cft.Executor = None,
 ) -> dict:
     """
     generate a single batch for training.
@@ -225,21 +185,14 @@ def generate_batch(
             }
     """
     # count batch size
-    batch_size = len(dataframe)
     batch_image = []
 
     # ###[process image]### #
     # process batch sequentialy
-    for x in range(batch_size):
-        # get image name and size from datadrame
-        image_name = dataframe.iloc[x][image_name_col]
-        width_height = [dataframe.iloc[x][width_col], dataframe.iloc[x][height_col]]
-
-        # grab iamge from path and then process it
-        image_path = pathlib.Path(folder_path, image_name)
-        image = process_image_fn(image_path, width_height)
-
-        batch_image.append(image)
+    image_names = dataframe[image_name_col]
+    image_sizes = zip(dataframe[width_col], dataframe[height_col])
+    mapper = map if executor is None else executor.map
+    batch_image = list(mapper(process_image_fn, image_names, image_sizes))
     # stack image into neat array
     batch_image = np.stack(batch_image)
     # as contiguous array

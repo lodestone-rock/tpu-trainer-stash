@@ -2,6 +2,7 @@
 import os
 
 os.environ["JAX_USE_PJRT_C_API_ON_TPU"] = "1"  # memory defrag do not disable!
+import concurrent.futures as cft
 import logging
 import random
 import sys
@@ -73,7 +74,6 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     repeat_batch = 10
 
     # batch generator (dataloader)
-    image_folder = "e6_dump/resized"
     image_name_col = "file"
     width_height = ["new_image_width", "new_image_height"]
     caption_col = "newtag_string"
@@ -552,33 +552,28 @@ def main(epoch=0, steps_offset=0, lr=2e-6):
     # ===============[simple dataloader]=============== #
 
     # spawn dataloader in another core
-    def generate_batch_wrapper(
-        list_of_batch: list, queue: Queue, print_debug: bool = False
-    ):
+    def generate_batch_wrapper(list_of_batch: list, queue: Queue):
         # loop until queue is full
-        for batch in list_of_batch:
-            current_batch = generate_batch(
-                process_image_fn=process_image,
-                tokenize_text_fn=tokenize_text,
-                tokenizer=tokenizer,
-                dataframe=data_processed.iloc[
-                    batch * batch_size : batch * batch_size + batch_size
-                ],
-                folder_path=image_folder,
-                image_name_col=image_name_col,
-                caption_col=caption_col,
-                caption_token_length=token_length,
-                width_col=width_height[0],
-                height_col=width_height[1],
-                batch_slice=token_concatenate_count,
-                score_col=score_col,
-            )
-            if print_debug and queue.full():
-                print("queue is full!")
-            # put task in queue
-            queue.put(current_batch)
-            if print_debug:
-                print(f"putting task {batch} into queue")
+        with cft.ThreadPoolExecutor() as thread_pool:
+            for batch in list_of_batch:
+                current_batch = generate_batch(
+                    process_image_fn=process_image,
+                    tokenize_text_fn=tokenize_text,
+                    tokenizer=tokenizer,
+                    dataframe=data_processed.iloc[
+                        batch * batch_size : batch * batch_size + batch_size
+                    ],
+                    image_name_col=image_name_col,
+                    caption_col=caption_col,
+                    caption_token_length=token_length,
+                    width_col=width_height[0],
+                    height_col=width_height[1],
+                    batch_slice=token_concatenate_count,
+                    score_col=score_col,
+                    executor=thread_pool,
+                )
+                # put task in queue
+                queue.put(current_batch)
 
     # ===============[training loop]=============== #
 
