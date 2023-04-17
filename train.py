@@ -64,7 +64,7 @@ def main(epoch=0, steps_offset=0, lr=1e-5):
     # pandas bucketing
     csv_file = "posts.csv"
     image_dir = "e6_dump/resized/"
-    batch_num = 20
+    batch_num = 16
     batch_size = jax.device_count() * batch_num
     maximum_resolution_area = [512**2]
     bucket_lower_bound_resolution = [512]
@@ -85,7 +85,7 @@ def main(epoch=0, steps_offset=0, lr=1e-5):
 
     # diffusers model
     # initial model
-    base_model_name = "size-512-squared_no-eos-bos_shuffled_lion-optim_dos-loss-asam-e"
+    base_model_name = "size-512-dos-asam-e"
     model_dir = f"e6_dump/{base_model_name}{epoch}"  # continue from last model
     weight_dtype = jnp.bfloat16  # mixed precision training
     optimizer_algorithm = "lion"
@@ -248,14 +248,14 @@ def main(epoch=0, steps_offset=0, lr=1e-5):
     if "eps" in inspect.signature(base_optim).parameters:
         u_net_opt_cfg["eps"] = epsilon
     u_net_optimizer = optax.chain(
-        optax.adaptive_grad_clip(1e-3), base_optim(**u_net_opt_cfg)
+        optax.clip_by_global_norm(1), base_optim(**u_net_opt_cfg)
     )
     text_encoder_opt_cfg = u_net_opt_cfg | dict(
         learning_rate=text_encoder_learning_rate * optim_factor,
         b2=0.999,
     )
     text_encoder_optimizer = optax.chain(
-        optax.adaptive_grad_clip(1e-3), base_optim(**text_encoder_opt_cfg)
+        optax.clip_by_global_norm(1), base_optim(**text_encoder_opt_cfg)
     )
     logging.info(f"setup optimizer: {optimizer_algorithm}")
 
@@ -296,7 +296,6 @@ def main(epoch=0, steps_offset=0, lr=1e-5):
 
         params = {"text_encoder": text_encoder_state.params, "unet": unet_state.params}
 
-        @jax.remat
         def compute_loss(params):
             # Convert images to latent space
             vae_outputs = vae.apply(
@@ -429,9 +428,10 @@ def main(epoch=0, steps_offset=0, lr=1e-5):
                 lambda a: jax.lax.all_gather(a, "batch", tiled=True),
                 (l2_err, labels),
             )
-            density = jax.nn.softmax(labels * util_tau)
+            # density = jax.nn.softmax(labels * util_tau)
+            density = jax.scipy.stats.gaussian_kde(labels).pdf(labels)
 
-            def dos_loss(l2_err, labels, density, lmbda_=0.25):
+            def dos_loss(l2_err, labels, density, lmbda_=0.10):
                 """
                 Try to regress more heavily onto images with high scores than
                 low scores. Weight by inverse of return density.
@@ -462,6 +462,10 @@ def main(epoch=0, steps_offset=0, lr=1e-5):
         else:
             desc = params
         loss, grad = jax.value_and_grad(compute_loss)(desc)
+        grad_dtype = jtu.tree_leaves(grad)[0].dtype
+        grad = jtu.tree_map(lambda a: a.astype(weight_dtype), grad)
+        grad = jax.lax.pmean(grad, "batch")
+        grad = jtu.tree_map(lambda a: a.astype(grad_dtype), grad)
         # update weight and bias value
         new_unet_state = unet_state.apply_gradients(grads=grad["unet"])
         new_text_encoder_state = text_encoder_state.apply_gradients(
